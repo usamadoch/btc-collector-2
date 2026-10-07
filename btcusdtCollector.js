@@ -199,6 +199,15 @@ const DEFAULT_AGG_BUBBLE_FLUSH_SIZE = 1000
 // Warn if any in-memory slice has been pending for longer than this before the hard buffer cap is hit
 const PERSISTENCE_WARN_THRESHOLD_MS = 5 * 60 * 1000 // 5 minutes
 
+// Maximum gap that will be backfilled automatically. Gaps larger than this
+// (e.g. on first startup or after a multi-day outage) are intentionally skipped:
+// the watermark is advanced to the current time and live collection resumes.
+// Configurable via COLLECTOR_MAX_BACKFILL_GAP_MS (default: 4 hours).
+const DEFAULT_MAX_BACKFILL_GAP_MS = 4 * 60 * 60 * 1000 // 4 hours
+const MAX_BACKFILL_GAP_MS = process.env.COLLECTOR_MAX_BACKFILL_GAP_MS
+    ? Number(process.env.COLLECTOR_MAX_BACKFILL_GAP_MS)
+    : DEFAULT_MAX_BACKFILL_GAP_MS
+
 // No longer using MongoDB collections
 
 const SOURCES = ['spot', 'futures']
@@ -502,20 +511,40 @@ function createBinanceStreamClient(source) {
 
             const gapStart = sourceState[source].lastTradeTimeMs
             if (gapStart) {
-                sourceState[source].isBackfilling = true
-                runBackfillUntilComplete(source, gapStart)
-                    .then((result) => {
-                        if (!result.ok) {
-                            markSourceGap(source, result.cursor, Date.now())
-                        }
+                const gapMs = Date.now() - gapStart
+                if (gapMs > MAX_BACKFILL_GAP_MS) {
+                    // Gap is too large to backfill (e.g. first startup with old watermark,
+                    // or a multi-day outage). Advance the watermark to now so that:
+                    //  - no historical pending slices are created
+                    //  - no HTTP 400 retry loop is triggered
+                    //  - persistence health is not degraded
+                    //  - live collection begins from the current position
+                    const advancedTo = Date.now()
+                    sourceState[source].lastTradeTimeMs = advancedTo
+                    sourceState[source].isBackfilling = false
+                    log.warn('gap exceeds max backfill window, skipping historical backfill and advancing watermark to current time', {
+                        source,
+                        gapMs,
+                        maxBackfillGapMs: MAX_BACKFILL_GAP_MS,
+                        skippedFrom: new Date(gapStart).toISOString(),
+                        advancedTo: new Date(advancedTo).toISOString(),
                     })
-                    .catch((error) => {
-                        log.error('backfill fatal error', { source, error: getErrorMessage(error) })
-                        markSourceGap(source, gapStart, Date.now())
-                    })
-                    .finally(() => {
-                        sourceState[source].isBackfilling = false
-                    })
+                } else {
+                    sourceState[source].isBackfilling = true
+                    runBackfillUntilComplete(source, gapStart)
+                        .then((result) => {
+                            if (!result.ok) {
+                                markSourceGap(source, result.cursor, Date.now())
+                            }
+                        })
+                        .catch((error) => {
+                            log.error('backfill fatal error', { source, error: getErrorMessage(error) })
+                            markSourceGap(source, gapStart, Date.now())
+                        })
+                        .finally(() => {
+                            sourceState[source].isBackfilling = false
+                        })
+                }
             } else {
                 sourceState[source].isBackfilling = false
             }
@@ -1807,4 +1836,5 @@ export const _test = {
     seedWatermarksFromDatabase,
     getRestBaseUrl,
     getProxyAgent,
+    MAX_BACKFILL_GAP_MS,
 }
